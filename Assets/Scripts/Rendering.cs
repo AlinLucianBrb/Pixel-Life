@@ -41,20 +41,59 @@ public class Rendering : MonoBehaviour
     ComputeBuffer textureBuffer;
 
     public ComputeShader computeShader;
-    RenderTexture renderTexture;
+
+    // Multi-pass RTs
+    RenderTexture baseRT;
+    RenderTexture overlayRT;      // mask output from Shade ("SmokeOut")
+    RenderTexture overlayTempRT;
+    RenderTexture overlayBlurRT;  // blurred overlay
+    RenderTexture waterRT;
+    RenderTexture finalRT;
 
     int width, height;
-    int kernel;
+
+    // Kernels
+    int kShade;
+    int kBlurH;
+    int kBlurV;
+    int kComposite;
+
+    const int TX = 8;
+    const int TY = 8;
+
+    // --- Project-specific ID mapping (set these to match PixelLife)
+    [Header("PixelLife ID Mapping")]
+    public int emptyId = 4;        // was black in the old shader; now treated as sky/air
+    public int waterId = 2;        // was blue in the old shader
+
+    [Header("Optional blurred overlay")]
+    [Tooltip("Set to -1 to disable. If you have a 'smoke/cloud/shadow' material ID, set it here.")]
+    public int overlayId = -1;
+
+    [Tooltip("Tint applied to the blurred overlay mask.")]
+    public Color overlayTint = new Color(0.10f, 0.11f, 0.14f, 1f);
+
+    [Range(0f, 2f)]
+    public float overlayStrength = 1.0f;
+
+    [Range(1f, 3f)]
+    public float overlayGamma = 1.1f;
 
     void Start()
     {
         width = World.instance.chunkSize * World.instance.noChunks.x;
         height = World.instance.chunkSize * World.instance.noChunks.y;
 
-        kernel = computeShader.FindKernel("CSMain");
+        // Find kernels by name (PixelLifeCorrectShader.compute must have these)
+        kShade = computeShader.FindKernel("Shade");
+        kBlurH = computeShader.FindKernel("BlurH");
+        kBlurV = computeShader.FindKernel("BlurV");
+        kComposite = computeShader.FindKernel("Composite");
 
         textureNativeArray = new NativeArray<uint>(World.instance.blocksData.Length, Allocator.Persistent);
-        textureBuffer = new ComputeBuffer(textureNativeArray.Length, sizeof(uint) * 4);
+
+        // IMPORTANT: stride is sizeof(uint) (4 bytes)
+        textureBuffer = new ComputeBuffer(textureNativeArray.Length, sizeof(uint));
     }
 
     void Update()
@@ -71,38 +110,108 @@ public class Rendering : MonoBehaviour
         };
 
         JobHandle jobHandle = renderingUpdateJob.Schedule(World.instance.blocksData.Length, 128);
-        jobHandle.Complete();       
+        jobHandle.Complete();
+    }
+
+    void EnsureRT(ref RenderTexture rt, int w, int h, RenderTextureFormat format, FilterMode filter)
+    {
+        if (rt != null && rt.width == w && rt.height == h && rt.format == format)
+            return;
+
+        if (rt != null) rt.Release();
+
+        rt = new RenderTexture(w, h, 0, format);
+        rt.enableRandomWrite = true;
+        rt.filterMode = filter;
+        rt.wrapMode = TextureWrapMode.Clamp;
+        rt.Create();
     }
 
     private void OnRenderImage(RenderTexture source, RenderTexture destination)
     {
-        if (renderTexture == null)
-        {
-            renderTexture = new RenderTexture(World.instance.chunkSize * World.instance.noChunks.x, World.instance.chunkSize * World.instance.noChunks.y, 1);
-            renderTexture.enableRandomWrite = true;
-            renderTexture.filterMode = FilterMode.Point;
-            renderTexture.Create();
-        }
-     
+        int w = width;
+        int h = height;
+
+        // Allocate RTs
+        EnsureRT(ref baseRT, w, h, RenderTextureFormat.ARGB32, FilterMode.Point);
+        EnsureRT(ref finalRT, w, h, RenderTextureFormat.ARGB32, FilterMode.Bilinear);
+
+        EnsureRT(ref overlayRT, w, h, RenderTextureFormat.RFloat, FilterMode.Point);
+        EnsureRT(ref overlayTempRT, w, h, RenderTextureFormat.RFloat, FilterMode.Point);
+        EnsureRT(ref overlayBlurRT, w, h, RenderTextureFormat.RFloat, FilterMode.Point);
+        EnsureRT(ref waterRT, w, h, RenderTextureFormat.RFloat, FilterMode.Point);
+
+        // Upload ids
         textureBuffer.SetData(textureNativeArray);
 
-        computeShader.SetInt("Width", width);
-        computeShader.SetBuffer(kernel, "Ids", textureBuffer);
-        computeShader.SetTexture(kernel, "Result", renderTexture);
+        int groupsX = (w + TX - 1) / TX;
+        int groupsY = (h + TY - 1) / TY;
 
-        // Must dispatch in 2D
-        int tx = 8, ty = 8; // must match numthreads in shader
-        int groupsX = (width + tx - 1) / tx;
-        int groupsY = (height + ty - 1) / ty;
+        // Common uniforms
+        computeShader.SetInt("Width", w);
+        computeShader.SetInt("Height", h);
+        computeShader.SetFloat("Time", Time.time);
 
-        computeShader.Dispatch(kernel, groupsX, groupsY, 1);
+        // ID mapping
+        computeShader.SetInt("EmptyId", emptyId);
+        computeShader.SetInt("WaterId", waterId);
+        computeShader.SetInt("SmokeId", overlayId);
 
-        Graphics.Blit(renderTexture, destination);
+        // Overlay params
+        computeShader.SetVector("SmokeTint", new Vector3(overlayTint.r, overlayTint.g, overlayTint.b));
+        computeShader.SetFloat("SmokeStrength", overlayStrength);
+        computeShader.SetFloat("SmokeGamma", overlayGamma);
+
+        // -------------------------
+        // Pass A: Shade -> baseRT + overlayRT + waterRT
+        // -------------------------
+        computeShader.SetBuffer(kShade, "Ids", textureBuffer);
+        computeShader.SetTexture(kShade, "BaseOut", baseRT);
+        computeShader.SetTexture(kShade, "SmokeOut", overlayRT);
+        computeShader.SetTexture(kShade, "WaterOut", waterRT);
+        computeShader.Dispatch(kShade, groupsX, groupsY, 1);
+
+        // -------------------------
+        // Pass B/C: Blur overlay if enabled
+        // -------------------------
+        if (overlayId >= 0)
+        {
+            computeShader.SetTexture(kBlurH, "InTex", overlayRT);
+            computeShader.SetTexture(kBlurH, "OutTex", overlayTempRT);
+            computeShader.Dispatch(kBlurH, groupsX, groupsY, 1);
+
+            computeShader.SetTexture(kBlurV, "InTex", overlayTempRT);
+            computeShader.SetTexture(kBlurV, "OutTex", overlayBlurRT);
+            computeShader.Dispatch(kBlurV, groupsX, groupsY, 1);
+        }
+        else
+        {
+            // If disabled, just copy overlayRT -> overlayBlurRT (keeps bindings simple)
+            Graphics.Blit(overlayRT, overlayBlurRT);
+        }
+
+        // -------------------------
+        // Pass D: Composite -> finalRT
+        // -------------------------
+        computeShader.SetTexture(kComposite, "BaseIn", baseRT);
+        computeShader.SetTexture(kComposite, "SmokeBlur", overlayBlurRT);
+        computeShader.SetTexture(kComposite, "WaterMask", waterRT);
+        computeShader.SetTexture(kComposite, "Result", finalRT);
+        computeShader.Dispatch(kComposite, groupsX, groupsY, 1);
+
+        Graphics.Blit(finalRT, destination);
     }
 
     private void OnDestroy()
     {
-        textureNativeArray.Dispose();
-        textureBuffer.Dispose();
+        if (textureNativeArray.IsCreated) textureNativeArray.Dispose();
+        if (textureBuffer != null) textureBuffer.Dispose();
+
+        if (baseRT != null) baseRT.Release();
+        if (overlayRT != null) overlayRT.Release();
+        if (overlayTempRT != null) overlayTempRT.Release();
+        if (overlayBlurRT != null) overlayBlurRT.Release();
+        if (waterRT != null) waterRT.Release();
+        if (finalRT != null) finalRT.Release();
     }
 }

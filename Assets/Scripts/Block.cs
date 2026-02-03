@@ -4,6 +4,7 @@ using Unity.Jobs;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
 using static UnityEngine.GraphicsBuffer;
+using UnityEngine.XR;
 
 public struct WorldSettings
 {
@@ -158,7 +159,7 @@ public struct BlockData
             // Eat if grass
             if (destId == (byte)Blocks.Grass)
             {
-                moved.energy = (byte)math.min(255, moved.energy + 40);
+                moved.energy = (byte)math.min(255, moved.energy + 20);
             }
 
             WriteBlock(ref arr, in s, target, moved);
@@ -174,7 +175,7 @@ public struct BlockData
             return;
 
         // Breed rule (tweak numbers)
-        if (energy >= 254 || social >= 255)
+        if (energy >= 150 || social >= 200)
         {
             if (TrySpawn(ref arr, in s, ref rng, (byte)Blocks.Human, out _))
             {
@@ -231,7 +232,7 @@ public struct BlockData
             if (np.Equals(posLast)) continue;
 
             byte dest = arr[GetPosInBlockArray(np, in s)].id;
-            if (dest != (byte)Blocks.Grass) continue;
+            if (dest == (byte)Blocks.Predator) continue;
 
             int score = CountNeighborsOfType(ref arr, in s, np, (byte)Blocks.Human);
             if (score > bestScore)
@@ -240,9 +241,14 @@ public struct BlockData
                 best = np;
                 found = true;
             }
+
+            if(!found)
+            {
+                best = np;
+            }
         }
 
-        if (found && !best.Equals(pos))
+        if (!best.Equals(pos))
         {
             int2 old = pos;
 
@@ -266,11 +272,11 @@ public struct BlockData
             return;
 
         // Optional: breed if very high energy
-        if (energy >= 254)
+        if (energy >= 120)
         {
             if (TrySpawn(ref arr, in s, ref rng, (byte)Blocks.Predator, out _))
             {
-                energy = (byte)math.max(0, energy - 120);
+                energy = (byte)math.max(0, energy - 60);
             }
         }
     }

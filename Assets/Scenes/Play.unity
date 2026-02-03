@@ -250,6 +250,12 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   computeShader: {fileID: 7200000, guid: a35b302fac53ef6418e39c5472cb3454, type: 3}
+  emptyId: 6
+  waterId: 2
+  overlayId: -1
+  overlayTint: {r: 0.1, g: 0.11, b: 0.14, a: 1}
+  overlayStrength: 1
+  overlayGamma: 1.1
 --- !u!114 &519420035
 MonoBehaviour:
   m_ObjectHideFlags: 0
